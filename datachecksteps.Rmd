@@ -1,0 +1,204 @@
+---
+title: "Data Chek"
+output:
+  html_document:
+    df_print: paged
+---
+
+
+This is to use IvyDB pricedata and another factor DB to tou ji dao ba. This file is to check the basic data integrity. It is reading from the root directory for the simplicity now.
+```{r include=FALSE}
+library(xts)
+# library(h2o)
+require(PerformanceAnalytics)
+require(quantmod)
+library(lubridate)
+library(data.table)
+library(tidyverse)
+library(tibbletime)
+
+
+```
+
+### **_Step.1 Read IVYDB mapping and ZY DB to inner_join on cusip._**
+ 
+
+```{r}
+
+mapping=readRDS("securitylist.rds") # the IVYDB mapping
+IVYmapping<-mapping %>%
+  select(SecurityID,CUSIP,Ticker) 
+
+print(head(IVYmapping))
+
+ZYmapping=read.csv("cusip.csv",stringsAsFactors = F, header = F) #ZY's mapping, no header, will add by myself.
+
+ZYmapping<-ZYmapping %>% 
+  rename(Date=V1,BBG=V2,CUSIP=V5,Name=V6) %>%  
+  select(Date,BBG,CUSIP,Name) # rename the columns, and only keep those columns
+print(head(ZYmapping))
+
+```
+We will do an inner_join and check on some tickers and the dimension of the DB.
+AAPL CUSIP==037833100 in ZYDB, ==03783310 in IVYDB, so we try to remove the last character in ZYDB?
+In the last print we will see 5 IDs from ZYDB is missing from IVY. 这里就是有些CUSIP的缺失问题，先暂时手动该来匹配了。
+记住IVY cusip只有8位，这个是一定要处理的，不然数据就对不齐了
+
+
+
+```{r}
+mess=paste("ZY DB # of stocks",nrow(ZYmapping))
+print(mess)
+
+mess=paste("IVY DB # of stocks",nrow(IVYmapping))
+print(mess)
+
+ZYmapping<-ZYmapping %>% 
+  mutate(CUSIP=str_sub(CUSIP,start=1,end=-2)) # remove the last digit
+
+finalmapping<-IVYmapping %>% 
+  inner_join(ZYmapping,by="CUSIP")
+
+mess=paste("megedDB # of stocks",nrow(finalmapping))
+print(mess)
+
+missingID=ZYmapping %>% 
+  filter(!CUSIP %in% finalmapping$CUSIP)
+
+print(missingID)
+
+# Something fucking weird is that GE's cusip is 36960430 in IVY? STX is G7997R10
+```
+
+I can directly modify my IVYDB for those 5 tickers
+
+```{r}
+IVYmapping2<-IVYmapping %>% 
+  mutate(CUSIP=ifelse(CUSIP=="36960430","36960410",CUSIP)) %>% 
+  mutate(CUSIP=ifelse(CUSIP=="57387410","G5876H10",CUSIP)) %>%
+  mutate(CUSIP=ifelse(CUSIP=="G7997R10","G7945M10",CUSIP)) %>%
+  mutate(CUSIP=ifelse(CUSIP=="44891N20","44891N10",CUSIP)) %>%
+  mutate(CUSIP=ifelse(CUSIP=="55024110","15670010",CUSIP)) 
+
+finalmapping<-IVYmapping2 %>% 
+  inner_join(ZYmapping,by="CUSIP") %>% 
+  mutate(Date=as.Date(Date)) %>% 
+  select(-Date) # remove the Date column for nowm, may need it later on for point in time study
+
+mess=paste("megedDB # of stocks",nrow(finalmapping))
+print(mess)
+
+print(head(finalmapping))
+```
+
+### **_Step.2 Check PB factor_**
+(1) Get the PB factor 所有的PB都是月底才有一个数值 然后日期不是交易日，所以需要我处理一下找出月份。
+```{r}
+
+# get the PB factors
+PBfactor<-read.csv("PBfactor.csv",stringsAsFactors = F)
+#change the column name and conver the date to R Date format
+PBfactor<-PBfactor %>% 
+  rename(Date=date,CUSIP=cusip) %>% 
+  mutate(Date=mdy(Date),Y=year(Date),M=month(Date)) %>% 
+  mutate(CUSIP=str_sub(CUSIP,start=1,end=-2)) # CUSIP treatment
+
+print(head(PBfactor))
+```
+(2) Get the IVYDB price data and inner_join with the mapping info at first.
+The pricedata was already na filled with previous valid data until delisting. Can check that proces again together.
+Will put into more details about the columns later.
+Price:unadjusted price. Cumret:adjusted for both split and dividend. splitAdj:split, check AAPL for an example.tempSPX:the SPX index value on that date.
+```{r}
+# using feather data now. Can switch to fst for faster data load if working with R only
+pricedata<-rio::import("JQCpricedata.feather")
+print(head(pricedata))
+
+newpricedata<-pricedata %>% 
+  inner_join(finalmapping,by="SecurityID") # about 1/10 of the all stock data, make sense ha
+print(head(newpricedata))
+```
+
+(3) Combine with the PB info. There could be 2 ways to deal with it. Inner_join or left_join and fill na
+with previous value. 这个地方还是比较关键的，因为我不是很确定你的数据生成的时候对于缺失值的处理。还有就是你后面如果其它财报因子是一个季度才有一次的话我估计用left_join可能好点
+<1> Inner_join style. Easy. We select the EOM price data into a "EOMdata" df and merge with the PB factor as the original data was at a daily frequency.
+```{r}
+#only select the price within the fundamental factor data range. can be flexible later
+minDate=min(PBfactor$Date)
+maxDate=max(PBfactor$Date)
+
+EOMdata<-newpricedata %>% 
+  select(Date,SecurityID,CUSIP,BBG,size_rank,Price,Cumret,tempSPX) %>% 
+  filter(Date>=minDate,Date<=maxDate) %>% 
+  mutate(M=month(Date),Y=year(Date)) %>% 
+  group_by(SecurityID,M,Y) %>%
+  arrange(Date) %>% 
+  filter(row_number()==n()) %>% 
+  ungroup()# select the last observation in a month for each ID
+
+print(head(EOMdata))
+
+### now inner_join by Month and Year for each ID
+final<-EOMdata %>% 
+  inner_join(PBfactor,by=c("CUSIP","Y","M"))
+print(head(final))
+## some data (1/3) from EOM are missing in the inner_joined data and we need to check some of them for details.这里就是有一个说明数据的不是Point-in-time的问题哈。问题不严重只是我们可以有几种解决方法。
+
+check1<-EOMdata %>% 
+  group_by(CUSIP) %>% 
+  summarise(n_ob_EOM=n())
+
+check2<-final %>% 
+  group_by(CUSIP) %>% 
+  summarise(n_ob_final=n())
+
+compare=check1 %>% 
+  inner_join(check2,by="CUSIP")
+
+print(head(compare))
+# 00123Q10 is not the same
+
+temp1<-EOMdata %>% 
+  filter(CUSIP=="00123Q10")
+temp2<-final %>% 
+  filter(CUSIP=="00123Q10")
+temp3<-PBfactor %>% 
+  filter(CUSIP=="00123Q10")
+
+print(temp1)
+print(temp2)
+print(temp3)
+
+## basically PBfactor for AGNC only started from 2016, 我认为你给的这个PBfactor就是当前的index成份股而不是历史的
+
+#we will just this biased data for now.
+```
+<2>Left_join style. Will be needed for daily factor models
+```{r}
+
+```
+
+(4) Use the "biased" PB factor to evaluate the factor performance.In my codes "y" is the return for the next period. date.y is from PBdata date.x is from pricedata. We will use decile rank for now and we can use Z-score weighted neutral style
+```{r}
+factordata<-final %>%
+  rename(Date=Date.y) %>% 
+  select(-Date.x) %>% 
+  group_by(SecurityID) %>% 
+  arrange(Date) %>% 
+  mutate(y=lead(Cumret)/Cumret)
+
+divs=10 # deciles.
+factorret<-factordata %>% 
+  group_by(M,Y) %>% 
+  mutate(decile=ntile(bp,divs)) %>% 
+  group_by(M,Y,decile) %>%
+  summarise(decileret=mean(y,na.rm=T)-1)
+
+factorret %>%
+    group_by(decile) %>%
+    summarise(Decileret=mean(decileret,na.rm=T)) %>%
+    ggplot(aes(x=decile,y=Decileret)) + geom_bar(stat = "identity") + ggtitle("PB factor")
+  
+  
+```
+
