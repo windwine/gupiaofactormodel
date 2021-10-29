@@ -1,0 +1,285 @@
+---
+title: "Data Check ver6 with 20211028data and the gics data"
+output:
+  html_document:
+    df_print: paged
+---
+
+
+This is to use IvyDB pricedata and another factor DB to tou ji dao ba. This file is to check the basic data integrity. It is reading from the root directory for the simplicity now.不再打印单独的因子的图了直接上ML。就只看最后一个图，有很多东西要实验的，尤其是X要不要求z-score这个东西很诡异哈，估计我们以后要坐在一起看.
+
+Now I am buring the previous data prep step so we will have fewer ouputs we will just check the graphs for each factor
+```{r include=FALSE}
+library(xts)
+# library(h2o)
+require(PerformanceAnalytics)
+require(quantmod)
+library(lubridate)
+library(data.table)
+library(tidyverse)
+library(tibbletime)
+
+
+```
+
+### **_Step.1 Read IVYDB mapping and ZY DB to inner_join on cusip._**
+ 
+
+```{r include=FALSE}
+
+mapping=readRDS("securitylist.rds") # the IVYDB mapping
+IVYmapping<-mapping %>%
+  select(SecurityID,CUSIP,Ticker) 
+
+print(head(IVYmapping))
+
+ZYmapping=read.csv("cusip.csv",stringsAsFactors = F, header = F) #ZY's mapping, no header, will add by myself.
+
+ZYmapping<-ZYmapping %>% 
+  rename(Date=V1,BBG=V2,CUSIP=V5,Name=V6) %>%  
+  select(Date,BBG,CUSIP,Name) # rename the columns, and only keep those columns
+print(head(ZYmapping))
+
+```
+
+
+
+```{r include=FALSE}
+mess=paste("ZY DB # of stocks",nrow(ZYmapping))
+print(mess)
+
+mess=paste("IVY DB # of stocks",nrow(IVYmapping))
+print(mess)
+
+ZYmapping<-ZYmapping %>% 
+  mutate(CUSIP=str_sub(CUSIP,start=1,end=-2)) # remove the last digit
+
+finalmapping<-IVYmapping %>% 
+  inner_join(ZYmapping,by="CUSIP")
+
+mess=paste("megedDB # of stocks",nrow(finalmapping))
+print(mess)
+
+missingID=ZYmapping %>% 
+  filter(!CUSIP %in% finalmapping$CUSIP)
+
+print(missingID)
+
+# Something fucking weird is that GE's cusip is 36960430 in IVY? STX is G7997R10
+```
+
+
+
+```{r include=FALSE}
+IVYmapping2<-IVYmapping %>% 
+  mutate(CUSIP=ifelse(CUSIP=="36960430","36960410",CUSIP)) %>% 
+  mutate(CUSIP=ifelse(CUSIP=="57387410","G5876H10",CUSIP)) %>%
+  mutate(CUSIP=ifelse(CUSIP=="G7997R10","G7945M10",CUSIP)) %>%
+  mutate(CUSIP=ifelse(CUSIP=="44891N20","44891N10",CUSIP)) %>%
+  mutate(CUSIP=ifelse(CUSIP=="55024110","15670010",CUSIP)) 
+
+finalmapping<-IVYmapping2 %>% 
+  inner_join(ZYmapping,by="CUSIP") %>%
+  mutate(Date=as.Date(Date)) %>% 
+  select(-Date) # remove the Date column for nowm, may need it later on for point in time study
+
+mess=paste("megedDB # of stocks",nrow(finalmapping))
+print(mess)
+
+print(head(finalmapping))
+```
+
+### **_Step.2 Check All the factors_**
+(1) Get the all factor file。
+```{r}
+
+
+allfactors=list()
+for (i in 1:1)
+{
+  filename=paste0("ss",".csv")
+  # get all the factors
+  factors<-fread(filename) 
+  colnames(factors)=c("Date","CUSIP","Factor","Value")
+  allfactors[[i]]=factors
+  mess=paste0("# of factors=",length(unique(factors$Factor)))
+  print(mess)
+  
+  
+}
+
+factors<-rbindlist(allfactors)
+
+factors<-factors %>% 
+  mutate(Date=as.Date(Date),Y=year(Date),M=month(Date)) %>% 
+  mutate(CUSIP=str_sub(CUSIP,start=1,end=-2)) # CUSIP treatment
+
+print(head(factors))
+mess=paste0("# of factors=",length(unique(factors$Factor)))
+print(mess)
+```
+(2) Get the IVYDB price data and inner_join with the mapping info at first. Check old rmd file for explanations.
+
+```{r}
+# using feather data now. Can switch to fst for faster data load if working with R only
+pricedata<-rio::import("JQCpricedata.feather")
+print(head(pricedata))
+
+newpricedata<-pricedata %>% 
+  inner_join(finalmapping,by="SecurityID") # about 1/10 of the all stock data, make sense ha
+print(head(newpricedata))
+```
+
+(3) Combine with each factor info. 看起来所有因子都对齐到了月末 所以可以用一个简单的办法change the factor df to wide format with each col being a single factor (这个要取决与数据格式 以后不一定这样合适哈)
+<1> Inner_join style on Date. 
+```{r}
+# expand factors to wide format
+factors<-unique(factors)
+factors_w<-factors %>% 
+  pivot_wider(names_from = Factor,values_from = Value,values_fn = length) # default is fill NA for missing factors
+
+#Some data has duplicate and I found 2015-03-31  57772K10 to have 2 bp lines, they are the same value so I am just
+# using mean to aggregate, now this batch of data is OK le compared to ver5.
+errordata<-factors %>% 
+  filter(Date=="2015-03-31",CUSIP=="57772K10",Factor=="bp")
+print(errordata)
+
+factors_w<-factors %>% 
+  pivot_wider(names_from = Factor,values_from = Value,values_fn = mean) # default is fill NA for missing factors
+
+## 现在看会有很多NA 所以后面算ML或者因子收益要多注意了， 这么多NA对ML有很多挑战 我之前也没有搞过这么多NA的，要我们一起
+#看这些NA的来的原因和是否可以fillna from prev non-na
+print(factors_w)
+
+
+```
+Now we can combine the factors with the price data
+```{r}
+final<-newpricedata %>% 
+  select(Date,SecurityID,CUSIP,BBG,size_rank,Price,Cumret,tempSPX) %>% 
+  inner_join(factors_w,by=c("CUSIP","Date"))
+
+
+```
+
+(4) Use the factors to evaluate the factor performance.In my codes "y" is the return for the next period. We will use decile rank for now and we can use Z-score weighted neutral style. I fill NA with previous value now.
+```{r include=FALSE}
+factordata<-final %>%
+  group_by(SecurityID) %>% 
+  arrange(Date) %>% 
+  mutate(y=lead(Cumret)/Cumret)  # you cannot do na.omit at this stage as you have so many NAs for factor columns
+
+divs=10 # deciles.
+
+factordata<-factordata %>% 
+  group_by(SecurityID) %>% 
+  arrange(Date) %>% 
+  fill(bp:zscore,.direction = "down")
+
+check<-final %>% 
+  filter(SecurityID==100892) # cusip==00105510
+print(check)
+#对于AFL grossmargin 一直NA? cusip==00105510 所以我只能fill 0?这样好像有点不合适， 有很多都是有na不能直接dropna？？
+
+nona<-na.omit(final)
+```
+### **_Step.3 The ML part._**
+A simple trial without careful treatment on the NAs. I have also added the month indicator for potential Jan effect
+```{r}
+library(ranger)
+
+final<-data.frame(factordata)
+final<-final %>% 
+  mutate(classy=y)
+
+# too many NAs and we can try to remove the columns
+ll<-is.na(final)
+cc=colSums(ll) ## 
+# python equivalent count the number of missing values in each column of the dataset df.isnull().sum()
+
+scale2 <- function(x, na.rm = TRUE) (x - mean(x, na.rm = na.rm)) / sd(x, na.rm)
+
+indexs=c(11:56,58)
+vars=colnames(final)[indexs] # classy and all the price factors
+vars="classy" # classy and all the price factors
+  
+final<-final %>%
+  group_by(Date) %>%
+  mutate_at(vars,scale2)
+
+check<-final %>% 
+  select(-(cfmargin3:zscore))
+
+final[is.na(final)]=0 # this one will fill the y to be 0 for the last observation so we just remove it
+# final<-na.omit(final)
+
+training<-final %>% 
+  filter(Y<2015)
+
+test<-final %>% 
+  filter(Y>=2015)
+
+indexs=c(10,11:55,58) # not to use the zscore
+colnames(final)[indexs]
+
+tree=ranger(classy~.,data=training[,indexs],num.threads=8,num.tree=500,#save.memory=T,
+            verbose=F,write.forest=T, importance = "impurity")
+forecastranger= predict (tree,test)
+
+forecast=forecastranger$predictions
+forecast2 =predict(tree,test,predict.all=T)
+forecast_sd=apply(forecast2$predictions, 1, sd)
+# forecast=forecast/forecast_sd
+
+bigtest=cbind(test,forecast) #for probability forecast
+colnames(bigtest)[dim(bigtest)[2]]=c("pred_y")
+
+
+var="pred_y"
+
+factorret<-bigtest %>% 
+  group_by(M,Y) %>% 
+  mutate(decile=ntile(get(var),divs)) %>% 
+  group_by(M,Y,decile) %>%
+  summarise(decileret=mean(y,na.rm=T)-1,Date=min(Date))
+
+check2<-factorret %>% 
+  group_by(M,Y) %>% 
+  summarise(Date=max(Date),ret=mean(decileret)) %>% 
+  ungroup() %>% 
+  arrange(Date) %>% 
+  mutate(NAV=cumprod(1+ret)) %>% 
+  filter(Date<="2021-09-01")
+
+p2<-check2 %>% 
+  ggplot(aes(x=Date,y=NAV))+geom_line()+ggtitle("equal weight benchmark")
+print(p2)
+
+p1<-factorret %>%
+  group_by(decile) %>%
+  summarise(Decileret=mean(decileret,na.rm=T)) %>%
+  ggplot(aes(x=decile,y=Decileret)) + geom_bar(stat = "identity") + ggtitle(var)
+print(p1)
+  
+LSret<-factorret %>% 
+  group_by(M,Y) %>% 
+  arrange(decile) %>% 
+  mutate(weight = case_when(
+      decile==10 ~ 1,
+      decile==1 ~ 0,
+      TRUE     ~ 0
+    ))
+
+strat=LSret %>% 
+  group_by(Date) %>% 
+  mutate(weight=weight/sum(abs(weight))) %>% 
+  summarise(portret=sum(weight*decileret)) %>% 
+  filter(Date<="2021-09-01")
+
+strats=xts(strat$portret,order.by = strat$Date)
+source("C:/jiaqifiles/R code/Persupportfunc.r")
+mess=paste0(var," long top decile only")
+PnLreport(strats,info = mess,freq=12)
+
+```
+
